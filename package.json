@@ -1,0 +1,5 @@
+"devDependencies": {
+  "@replayio/jest": "^1.0.0",
+  "jest": "^29.0.0",
+  "replayio": "^0.2.0"
+}
