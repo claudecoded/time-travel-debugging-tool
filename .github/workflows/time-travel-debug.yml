@@ -1,4 +1,4 @@
-name: Time-Travel Debugger CI
+name: Open-Source Time-Travel Debugger
 
 on:
   pull_request:
@@ -9,65 +9,69 @@ permissions:
   pull-requests: write
 
 jobs:
-  test-and-record:
-    name: Run and Record Tests with Time-Travel
+  record-failures:
+    name: Record Execution Trace via RR
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Setup Environment Dependencies
+        run: |
+          sudo apt-get update
+          # Install rr debugger and development tools needed for capture
+          sudo apt-get install -y rr gdb
+          
+          # CRITICAL FOR RR: GitHub Runners need permission to read performance counters
+          sudo sysctl -w kernel.perf_event_paranoid=1
+
       - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Install Dependencies
+      - name: Install Project Dependencies
         run: npm ci
 
-      - name: Install Replay Chromium Browser
-        run: npx replayio install
-
-      - name: Execute Tests with Time-Travel Recording
-        id: run-tests
-        # We record the test run using replayio prefix to trap the execution state
-        run: npx replayio record npm test
+      - name: Run Tests Under Time-Travel Recorder
+        id: test-run
+        # rr record logs the execution of the process tree natively
+        run: rr record npm test
         continue-on-error: true
 
-      - name: Upload Time-Travel Recording to Cloud
-        if: steps.run-tests.outcome == 'failure'
-        id: upload-recording
-        env:
-          REPLAY_API_KEY: \${{ secrets.REPLAY_API_KEY }}
+      - name: Pack Time-Travel Trace Log
+        if: steps.test-run.outcome == 'failure'
         run: |
-          echo "Test suite failed! Uploading recording to Replay DevTools cloud..."
-          # Uploads recordings and filters the output to extract the view URL
-          npx replayio upload --json > replay_metadata.json
-          
-          # Extracts the first recording URL from the generated JSON report
-          RECORDING_URL=\$(node -e "
-            const fs = require('fs');
-            const data = JSON.parse(fs.readFileSync('replay_metadata.json', 'utf8'));
-            if(data.recordings && data.recordings.length > 0) {
-              console.log('https://replay.io' + data.recordings[0].id);
-            } else {
-              console.log('NOT_FOUND');
-            }
-          ")
-          echo "URL=\$RECORDING_URL" >> \$GITHUB_OUTPUT
+          echo "Test suite failed! Bundling the deterministic execution trace..."
+          # Locates the latest rr recording directory and tars it
+          LATEST_TRACE=\$(ls -td ~/.local/share/rr/* | head -n 1)
+          tar -czf time-travel-trace.tar.gz -C \((dirname\)LATEST_TRACE) \((basename\)LATEST_TRACE)
 
-      - name: Post Time-Travel Debug Link on Pull Request
-        if: steps.run-tests.outcome == 'failure' && steps.upload-recording.outputs.URL != 'NOT_FOUND'
+      - name: Upload Time-Travel Artifact to GitHub
+        if: steps.test-run.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: time-travel-debug-trace
+          path: time-travel-trace.tar.gz
+          retention-days: 5
+
+      - name: Notify Developer on Pull Request
+        if: steps.test-run.outcome == 'failure'
         uses: actions/github-script@v7
         with:
           script: |
-            const recordingUrl = "\${{ steps.upload-recording.outputs.URL }}";
-            
-            const commentBody = `### 🚨 Test Suite Failed! Time-Travel Debugger Ready\n\n` +
-              `A test failed during the CI run. Instead of downloading logs, you can replay the exact execution trace line-by-line in your browser:\n\n` +
-              `👉 **[Click Here to Open Time-Travel Debugger]('\${recordingUrl}')**\n\n` +
-              `*Inside the Replay UI, you can add retro-active console.logs, step backward through execution blocks, and inspect variable states at any millisecond.*`;
+            const commentBody = `### 🔍 Open-Source Time-Travel Debug Trace Generated!\n\n` +
+              `A test failed during this CI execution. An execution snapshot has been recorded.\n\n` +
+              `**How to debug this failure locally step-by-step:**\n` +
+              `1. Download the \`time-travel-debug-trace\` zip file from the **Summary/Artifacts** tab of this workflow run.\n` +
+              `2. Extract the file into your local Linux/WSL environment.\n` +
+              `3. Make sure \`rr\` is installed (\`sudo apt install rr\`).\n` +
+              `4. Run the reverse-debugger locally to walk backward in time:\n` +
+              `   \`\`\`bash\n` +
+              `   rr replay ./path_to_extracted_trace_folder\n` +
+              `   \`\`\`\n` +
+              `5. Use standard GDB commands like \`reverse-next\` (\`rn\`) or \`reverse-step\` (\`rs\`) to watch variables change in reverse!`;
 
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -76,5 +80,4 @@ jobs:
               body: commentBody
             });
 
-            // Force CI failure so the PR stays blocked until fixed
-            core.setFailed("Tests failed. Please use the time-travel link above to debug the issue.");
+            core.setFailed("Execution failed. Time-travel diagnostics trace is available in the run artifacts.");
